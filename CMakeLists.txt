@@ -109,7 +109,7 @@ add_subdirectory(libOTe_Tests)
 #############################################
 #              Build Frontend               #
 #############################################
-add_subdirectory(frontend)
+
 
 
 

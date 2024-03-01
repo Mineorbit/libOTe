@@ -5,6 +5,7 @@
 #include "libOTe/NChooseOne/Kkrt/KkrtNcoOtReceiver.h"
 #include "libOTe/NChooseOne/Kkrt/KkrtNcoOtSender.h"
 #include "cryptoTools/Common/Matrix.h"
+#include "cryptoTools/Crypto/PRNG.h"
 #include "libOTe/Tools/Coproto.h"
 #include "util.h"
 #include "coproto/Socket/AsioSocket.h"

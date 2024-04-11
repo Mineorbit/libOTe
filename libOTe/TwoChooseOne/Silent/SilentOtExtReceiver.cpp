@@ -385,7 +385,7 @@ namespace osuCrypto
             i = u64{}, j = u64{}, main = u64{}
         );
 
-        gTimer.setTimePoint("recver.ot.enter");
+        setTimePoint("recver.expand.enter");
 
         if (isConfigured() == false)
         {
@@ -403,21 +403,21 @@ namespace osuCrypto
         }
 
         setTimePoint("recver.expand.start");
-        gTimer.setTimePoint("recver.expand.start");
 
 
         mA.resize(mNoiseVecSize);
         mC.resize(0);
 
-
         MC_AWAIT(mGen.expand(chl, mA, PprfOutputFormat::Interleaved, true, mNumThreads));
-        setTimePoint("recver.expand.pprf_transpose");
-        gTimer.setTimePoint("recver.expand.pprf_transpose");
-
+        setTimePoint("recver.expand.pprf");
 
         if (mMalType == SilentSecType::Malicious)
-            MC_AWAIT(ferretMalCheck(chl, prng));
+        {
 
+            MC_AWAIT(ferretMalCheck(chl, prng));
+            setTimePoint("recver.expand.malCheck");
+
+        }
 
         if (mDebug)
         {
@@ -426,6 +426,7 @@ namespace osuCrypto
         }
 
         compress(type);
+        setTimePoint("recver.expand.dualEncode");
 
         mA.resize(mRequestNumOts);
 
@@ -565,14 +566,12 @@ namespace osuCrypto
             // not implemented.
             throw RTE_LOC;
         }
-        setTimePoint("recver.expand.ldpc.mCopyHash");
+        setTimePoint("recver.expand.CopyHash");
 
     }
 
     void SilentOtExtReceiver::compress(ChoiceBitPacking packing)// )
     {
-
-        setTimePoint("recver.expand.ldpc.mult");
 
         if (packing == ChoiceBitPacking::True)
         {
@@ -600,7 +599,8 @@ namespace osuCrypto
             // set the lsb of mA to be mC.
             for (auto p : mS)
                 mA[p] = mA[p] | OneBlock;
-            setTimePoint("recver.expand.ldpc.mask");
+
+            setTimePoint("recver.expand.bitPacking");
 
             switch (mMultType)
             {
@@ -651,7 +651,7 @@ namespace osuCrypto
 
                 experimental::TungstenCode encoder;
                 encoder.config(oc::roundUpTo(mRequestNumOts, 8), mNoiseVecSize);
-                encoder.dualEncode<block, CoeffCtxGF2>(mA.begin(), {});
+                encoder.dualEncode<block, CoeffCtxGF2>(mA.begin(), {}, mEncodeTemp);
                 break;
             }
             default:
@@ -659,7 +659,7 @@ namespace osuCrypto
                 break;
             }
 
-            setTimePoint("recver.expand.ldpc.dualEncode");
+            setTimePoint("recver.expand.dualEncode");
 
         }
         else
@@ -733,7 +733,7 @@ namespace osuCrypto
             {
                 experimental::TungstenCode encoder;
                 encoder.config(roundUpTo(mRequestNumOts, 8), mNoiseVecSize);
-                encoder.dualEncode<block, CoeffCtxGF2>(mA.begin(), {});
+                encoder.dualEncode<block, CoeffCtxGF2>(mA.begin(), {}, mEncodeTemp);
                 encoder.dualEncode<u8, CoeffCtxGF2>(mC.begin(), {});
                 break;
             }
@@ -742,7 +742,7 @@ namespace osuCrypto
                 break;
             }
             
-            setTimePoint("recver.expand.ldpc.dualEncode");
+            setTimePoint("recver.expand.dualEncode2");
         }
     }
 

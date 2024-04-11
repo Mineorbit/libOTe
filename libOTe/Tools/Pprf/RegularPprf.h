@@ -27,15 +27,34 @@ namespace osuCrypto
     >
     class RegularPprfSender : public TimerAdapter {
     public:
-        u64 mDomain = 0, mDepth = 0, mPntCount = 0;
+
+        // the number of leaves in a single tree.
+        u64 mDomain = 0;
+
+        // the depth of each tree.
+        u64 mDepth = 0;
+
+        // the number of trees, must be a multiple of 8.
+        u64 mPntCount = 0;
+
+        // the values that should be programmed at the punctured points.
         std::vector<F> mValue;
+
+        // the base OTs that should be set.
         Matrix<std::array<block, 2>> mBaseOTs;
+
+        // if true, tree OT messages are eagerly sent in batches of 8.
+        // otherwise, the OT messages are sent in a single batch.
+        bool mEagerSend = true;
 
         using VecF = typename CoeffCtx::template Vec<F>;
         using VecG = typename CoeffCtx::template Vec<G>;
 
+        // a function that can be used to output the result of the PPRF.
         std::function<void(u64 treeIdx, VecF& leaf)> mOutputFn;
 
+        // an internal buffer that is used to expand the tree.
+        AlignedUnVector<block> mTempBuffer;
 
         RegularPprfSender() = default;
 
@@ -109,14 +128,30 @@ namespace osuCrypto
                 buff = std::vector<u8>{},
                 encSums = span<std::array<block, 2>>{},
                 leafMsgs = span<u8>{},
-                mTreeAlloc = pprf::TreeAllocator{}
+                encStepSize = u64{},
+                leafStepSize = u64{},
+                encOffset = u64{},
+                leafOffset = u64{},
+                min = u64{},
+                dd = u64{}
             );
 
-            mTreeAlloc.reserve(numThreads, (1ull << mDepth) + 2);
             setTimePoint("SilentMultiPprfSender.reserve");
 
-            levels.resize(mDepth);
-            pprf::allocateExpandTree(mTreeAlloc, levels);
+            dd = mDomain > 2 ? roundUpTo((mDomain + 1) / 2, 2) : 1;
+            pprf::allocateExpandTree(dd, mTempBuffer, levels);
+            assert(levels.size() == mDepth);
+
+            if (!mEagerSend)
+            {
+                // we need to allocate one large buffer that will store all OT messages.
+                pprf::allocateExpandBuffer<F>(
+                    mDepth - 1, mPntCount, programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                encStepSize = encSums.size() / mPntCount;
+                leafStepSize = leafMsgs.size() / mPntCount;
+                encOffset = 0;
+                leafOffset = 0;
+            }
 
             for (treeIndex = 0; treeIndex < mPntCount; treeIndex += 8)
             {
@@ -136,14 +171,38 @@ namespace osuCrypto
                     leafLevelPtr = &leafLevel;
                 }
 
-                // allocate the send buffer and partition it.
-                pprf::allocateExpandBuffer<F>(
-                    mDepth - 1, std::min<u64>(8, mPntCount - treeIndex), programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                min = std::min<u64>(8, mPntCount - treeIndex);
+                if (mEagerSend)
+                {
+                    // allocate a send buffer for the next 8 trees.
+                    pprf::allocateExpandBuffer<F>(
+                        mDepth - 1, min, programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                    encStepSize = encSums.size() / min;
+                    leafStepSize = leafMsgs.size() / min;
+                    encOffset = 0;
+                    leafOffset = 0;
+                }
 
                 // exapnd the tree
-                expandOne(seed, treeIndex, programPuncturedPoint, levels, *leafLevelPtr, leafIndex, encSums, leafMsgs, ctx);
+                expandOne(
+                    seed,
+                    treeIndex,
+                    programPuncturedPoint,
+                    levels,
+                    *leafLevelPtr,
+                    leafIndex,
+                    encSums.subspan(encOffset, encStepSize * min),
+                    leafMsgs.subspan(leafOffset, leafStepSize * min),
+                    ctx);
 
-                MC_AWAIT(chl.send(std::move(buff)));
+                encOffset += encStepSize * min;
+                leafOffset += leafStepSize * min;
+
+                if (mEagerSend)
+                {
+                    // send the buffer for the current set of trees.
+                    MC_AWAIT(chl.send(std::move(buff)));
+                }
 
                 // if we aren't interleaved, we need to copy the
                 // leaf layer to the output.
@@ -152,9 +211,14 @@ namespace osuCrypto
 
             }
 
+
+            if (!mEagerSend)
+            {
+                // send the buffer for all of the trees.
+                MC_AWAIT(chl.send(std::move(buff)));
+            }
+
             mBaseOTs = {};
-            //mTreeAlloc.del(tree);
-            mTreeAlloc.clear();
 
             setTimePoint("SilentMultiPprfSender.de-alloc");
 
@@ -294,8 +358,8 @@ namespace osuCrypto
                 // encrypt the sums and write them to the output.
                 for (u64 j = 0; j < remTrees; ++j)
                 {
-                    (*encSumIter)[0] = sums[0][j] ^ mBaseOTs[treeIdx + j][mDepth - 1 - d][1];
-                    (*encSumIter)[1] = sums[1][j] ^ mBaseOTs[treeIdx + j][mDepth - 1 - d][0];
+                    (*encSumIter)[0] = sums[0][j] ^ mBaseOTs(treeIdx + j, mDepth - 1 - d)[1];
+                    (*encSumIter)[1] = sums[1][j] ^ mBaseOTs(treeIdx + j, mDepth - 1 - d)[0];
                     ++encSumIter;
                 }
             }
@@ -319,45 +383,57 @@ namespace osuCrypto
             ctx.zero(leafSums[0].begin(), leafSums[0].end());
             ctx.zero(leafSums[1].begin(), leafSums[1].end());
 
+            auto outIter = leafLevel.begin() + leafOffset;
+
             // for the leaf nodes we need to hash both children.
-            for (u64 parentIdx = 0, outIdx = leafOffset, childIdx = 0; parentIdx < width; ++parentIdx)
+            for (u64 parentIdx = 0, childIdx = 0; parentIdx < width; ++parentIdx)
             {
                 // The value of the parent.
                 auto& parent = level0.data()[parentIdx];
 
                 // The bit that indicates if we are on the left child (0)
                 // or on the right child (1).
-                for (u64 keep = 0; keep < 2; ++keep, ++childIdx, outIdx += 8)
+                for (u64 keep = 0; keep < 2; ++keep, ++childIdx)
                 {
                     // The child that we will write in this iteration.
 
-                    // Each parent is expanded into the left and right children
-                    // using a different AES fixed-key. Therefore our OWF is:
-                    //
-                    //    H(x) = (AES(k0, x) + x) || (AES(k1, x) + x);
-                    //
-                    // where each half defines one of the children.
-                    gGgmAes[keep].hashBlocks<8>(parent.data(), child.data());
+                    if constexpr (std::is_same_v<F, block>)
+                    {
+                        gGgmAes.data()[keep].hashBlocks<8>(parent.data(), outIter);
+                    }
+                    else
+                    {
+                        // Each parent is expanded into the left and right children
+                        // using a different AES fixed-key. Therefore our OWF is:
+                        //
+                        //    H(x) = (AES(k0, x) + x) || (AES(k1, x) + x);
+                        //
+                        // where each half defines one of the children.
+                        gGgmAes.data()[keep].hashBlocks<8>(parent.data(), child.data());
 
-                    ctx.fromBlock(leafLevel[outIdx + 0], child[0]);
-                    ctx.fromBlock(leafLevel[outIdx + 1], child[1]);
-                    ctx.fromBlock(leafLevel[outIdx + 2], child[2]);
-                    ctx.fromBlock(leafLevel[outIdx + 3], child[3]);
-                    ctx.fromBlock(leafLevel[outIdx + 4], child[4]);
-                    ctx.fromBlock(leafLevel[outIdx + 5], child[5]);
-                    ctx.fromBlock(leafLevel[outIdx + 6], child[6]);
-                    ctx.fromBlock(leafLevel[outIdx + 7], child[7]);
+                        ctx.fromBlock(*(outIter + 0), child.data()[0]);
+                        ctx.fromBlock(*(outIter + 1), child.data()[1]);
+                        ctx.fromBlock(*(outIter + 2), child.data()[2]);
+                        ctx.fromBlock(*(outIter + 3), child.data()[3]);
+                        ctx.fromBlock(*(outIter + 4), child.data()[4]);
+                        ctx.fromBlock(*(outIter + 5), child.data()[5]);
+                        ctx.fromBlock(*(outIter + 6), child.data()[6]);
+                        ctx.fromBlock(*(outIter + 7), child.data()[7]);
+                    }
 
                     // leafSum += child
                     auto& leafSum = leafSums[keep];
-                    ctx.plus(leafSum[0], leafSum[0], leafLevel[outIdx + 0]);
-                    ctx.plus(leafSum[1], leafSum[1], leafLevel[outIdx + 1]);
-                    ctx.plus(leafSum[2], leafSum[2], leafLevel[outIdx + 2]);
-                    ctx.plus(leafSum[3], leafSum[3], leafLevel[outIdx + 3]);
-                    ctx.plus(leafSum[4], leafSum[4], leafLevel[outIdx + 4]);
-                    ctx.plus(leafSum[5], leafSum[5], leafLevel[outIdx + 5]);
-                    ctx.plus(leafSum[6], leafSum[6], leafLevel[outIdx + 6]);
-                    ctx.plus(leafSum[7], leafSum[7], leafLevel[outIdx + 7]);
+                    ctx.plus(leafSum.data()[0], leafSum.data()[0], *(outIter + 0));
+                    ctx.plus(leafSum.data()[1], leafSum.data()[1], *(outIter + 1));
+                    ctx.plus(leafSum.data()[2], leafSum.data()[2], *(outIter + 2));
+                    ctx.plus(leafSum.data()[3], leafSum.data()[3], *(outIter + 3));
+                    ctx.plus(leafSum.data()[4], leafSum.data()[4], *(outIter + 4));
+                    ctx.plus(leafSum.data()[5], leafSum.data()[5], *(outIter + 5));
+                    ctx.plus(leafSum.data()[6], leafSum.data()[6], *(outIter + 6));
+                    ctx.plus(leafSum.data()[7], leafSum.data()[7], *(outIter + 7));
+
+                    outIter += 8;
+                    assert(outIter <= leafLevel.end());
                 }
 
             }
@@ -452,17 +528,34 @@ namespace osuCrypto
     class RegularPprfReceiver : public TimerAdapter
     {
     public:
-        u64 mDomain = 0, mDepth = 0, mPntCount = 0;
+
+        // the number of leaves in a single tree.
+        u64 mDomain = 0;
+
+        // the depth of each tree.
+        u64 mDepth = 0;
+
+        // the number of trees, must be a multiple of 8.
+        u64 mPntCount = 0;
+
         using VecF = typename CoeffCtx::template Vec<F>;
         using VecG = typename CoeffCtx::template Vec<G>;
 
-        //std::vector<u64> mPoints;
-
+        // base ots that will be used to expand the tree.
         Matrix<block> mBaseOTs;
 
+        // the choice bits, each row should be the bit decomposition of the active path.
         Matrix<u8> mBaseChoices;
 
+        // if true, tree OT messages are eagerly sent in batches of 8.
+        // otherwise, the OT messages are sent in a single batch.
+        bool mEagerSend = true;
+
+        // a function that can be used to output the result of the PPRF.
         std::function<void(u64 treeIdx, VecF& leafs)> mOutputFn;
+
+        // an internal buffer that is used to expand the tree.
+        AlignedUnVector<block> mTempBuffer;
 
         RegularPprfReceiver() = default;
         RegularPprfReceiver(const RegularPprfReceiver&) = delete;
@@ -626,19 +719,38 @@ namespace osuCrypto
                 buff = std::vector<u8>{},
                 encSums = span<std::array<block, 2>>{},
                 leafMsgs = span<u8>{},
-                mTreeAlloc = pprf::TreeAllocator{},
-                points = std::vector<u64>{}
+                points = std::vector<u64>{},
+                encStepSize = u64{},
+                leafStepSize = u64{},
+                encOffset = u64{},
+                leafOffset = u64{},
+                min = u64{},
+                dd = u64{}
             );
 
             setTimePoint("SilentMultiPprfReceiver.start");
             points.resize(mPntCount);
             getPoints(points, PprfOutputFormat::ByLeafIndex);
 
-            mTreeAlloc.reserve(1, (1ull << mDepth) + 2);
-            setTimePoint("SilentMultiPprfSender.reserve");
+            //setTimePoint("SilentMultiPprfSender.reserve");
 
-            levels.resize(mDepth);
-            pprf::allocateExpandTree(mTreeAlloc, levels);
+            dd = mDomain > 2 ? roundUpTo((mDomain + 1) / 2, 2) : 1;
+            pprf::allocateExpandTree(dd, mTempBuffer, levels);
+            assert(levels.size() == mDepth);
+
+
+            if (!mEagerSend)
+            {
+                // we need to allocate one large buffer that will store all OT messages.
+                pprf::allocateExpandBuffer<F>(
+                    mDepth - 1, mPntCount, programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                encStepSize = encSums.size() / mPntCount;
+                leafStepSize = leafMsgs.size() / mPntCount;
+                encOffset = 0;
+                leafOffset = 0;
+
+                MC_AWAIT(chl.recv(buff));
+            }
 
             for (treeIndex = 0; treeIndex < mPntCount; treeIndex += 8)
             {
@@ -658,14 +770,34 @@ namespace osuCrypto
                     leafLevelPtr = &leafLevel;
                 }
 
-                // allocate the send buffer and partition it.
-                pprf::allocateExpandBuffer<F>(mDepth - 1, std::min<u64>(8, mPntCount - treeIndex),
-                    programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                min = std::min<u64>(8, mPntCount - treeIndex);
+                if (mEagerSend)
+                {
 
-                MC_AWAIT(chl.recv(buff));
+                    // allocate the send buffer and partition it.
+                    pprf::allocateExpandBuffer<F>(mDepth - 1, min,
+                        programPuncturedPoint, buff, encSums, leafMsgs, ctx);
+                    encStepSize = encSums.size() / min;
+                    leafStepSize = leafMsgs.size() / min;
+                    encOffset = 0;
+                    leafOffset = 0;
+                    MC_AWAIT(chl.recv(buff));
+                }
 
                 // exapnd the tree
-                expandOne(treeIndex, programPuncturedPoint, levels, *leafLevelPtr, leafIndex, encSums, leafMsgs, points, ctx);
+                expandOne(
+                    treeIndex, 
+                    programPuncturedPoint, 
+                    levels, 
+                    *leafLevelPtr, 
+                    leafIndex,
+                    encSums.subspan(encOffset, encStepSize * min),
+                    leafMsgs.subspan(leafOffset, leafStepSize * min),
+                    points, 
+                    ctx);
+
+                encOffset += encStepSize * min;
+                leafOffset += leafStepSize * min;
 
                 // if we aren't interleaved, we need to copy the
                 // leaf layer to the output.
@@ -676,8 +808,6 @@ namespace osuCrypto
             setTimePoint("SilentMultiPprfReceiver.join");
 
             mBaseOTs = {};
-            //mTreeAlloc.del(tree);
-            mTreeAlloc.clear();
 
             setTimePoint("SilentMultiPprfReceiver.de-alloc");
 
@@ -771,9 +901,11 @@ namespace osuCrypto
                     // The already constructed level. Only missing the
                     // GGM tree node value along the active path.
                     auto level0 = levels[d];
+                    assert(level0.size() == width || level0.size() == width + 1);
 
                     // The next level that we want to construct.
                     auto level1 = levels[d + 1];
+                    assert(level1.size() == width * 2);
 
                     for (u64 parentIdx = 0, childIdx = 0; parentIdx < width; ++parentIdx, childIdx += 2)
                     {
@@ -864,7 +996,7 @@ namespace osuCrypto
                         level1[siblingIdx][i] =
                             (*theirSumsIter)[notAi] ^
                             mySums[notAi][i] ^
-                            mBaseOTs[i + treeIdx][mDepth - 1 - d];
+                            mBaseOTs(i + treeIdx, mDepth - 1 - d);
 
                         ++theirSumsIter;
 
@@ -900,40 +1032,50 @@ namespace osuCrypto
                         ctx.copy(leafSums[k][i], leafSums[k][0]);
                 }
 
+                auto outIter = leafLevel.begin() + outputOffset;
                 // for leaf nodes both children should be hashed.
-                for (u64 parentIdx = 0, childIdx = 0, outputIdx = outputOffset; parentIdx < width; ++parentIdx)
+                for (u64 parentIdx = 0, childIdx = 0; parentIdx < width; ++parentIdx)
                 {
                     // The value of the parent.
-                    auto parent = level0[parentIdx];
+                    auto parent = level0.data()[parentIdx];
 
-                    for (u64 keep = 0; keep < 2; ++keep, ++childIdx, outputIdx += 8)
+                    for (u64 keep = 0; keep < 2; ++keep, ++childIdx)
                     {
-                        // Each parent is expanded into the left and right children
-                        // using a different AES fixed-key. Therefore our OWF is:
-                        //
-                        //    H(x) = (AES(k0, x) + x) || (AES(k1, x) + x);
-                        //
-                        // where each half defines one of the children.
-                        gGgmAes[keep].hashBlocks<8>(parent.data(), child.data());
+                        if constexpr (std::is_same_v<F, block>)
+                        {
+                            gGgmAes.data()[keep].hashBlocks<8>(parent.data(), outIter);
+                        }
+                        else
+                        {
+                            // Each parent is expanded into the left and right children
+                            // using a different AES fixed-key. Therefore our OWF is:
+                            //
+                            //    H(x) = (AES(k0, x) + x) || (AES(k1, x) + x);
+                            //
+                            // where each half defines one of the children.
+                            gGgmAes.data()[keep].hashBlocks<8>(parent.data(), child.data());
 
-                        ctx.fromBlock(leafLevel[outputIdx + 0], child[0]);
-                        ctx.fromBlock(leafLevel[outputIdx + 1], child[1]);
-                        ctx.fromBlock(leafLevel[outputIdx + 2], child[2]);
-                        ctx.fromBlock(leafLevel[outputIdx + 3], child[3]);
-                        ctx.fromBlock(leafLevel[outputIdx + 4], child[4]);
-                        ctx.fromBlock(leafLevel[outputIdx + 5], child[5]);
-                        ctx.fromBlock(leafLevel[outputIdx + 6], child[6]);
-                        ctx.fromBlock(leafLevel[outputIdx + 7], child[7]);
-
+                            ctx.fromBlock(*(outIter + 0), child.data()[0]);
+                            ctx.fromBlock(*(outIter + 1), child.data()[1]);
+                            ctx.fromBlock(*(outIter + 2), child.data()[2]);
+                            ctx.fromBlock(*(outIter + 3), child.data()[3]);
+                            ctx.fromBlock(*(outIter + 4), child.data()[4]);
+                            ctx.fromBlock(*(outIter + 5), child.data()[5]);
+                            ctx.fromBlock(*(outIter + 6), child.data()[6]);
+                            ctx.fromBlock(*(outIter + 7), child.data()[7]);
+                        }
                         auto& leafSum = leafSums[keep];
-                        ctx.plus(leafSum[0], leafSum[0], leafLevel[outputIdx + 0]);
-                        ctx.plus(leafSum[1], leafSum[1], leafLevel[outputIdx + 1]);
-                        ctx.plus(leafSum[2], leafSum[2], leafLevel[outputIdx + 2]);
-                        ctx.plus(leafSum[3], leafSum[3], leafLevel[outputIdx + 3]);
-                        ctx.plus(leafSum[4], leafSum[4], leafLevel[outputIdx + 4]);
-                        ctx.plus(leafSum[5], leafSum[5], leafLevel[outputIdx + 5]);
-                        ctx.plus(leafSum[6], leafSum[6], leafLevel[outputIdx + 6]);
-                        ctx.plus(leafSum[7], leafSum[7], leafLevel[outputIdx + 7]);
+                        ctx.plus(leafSum.data()[0], leafSum.data()[0], *(outIter + 0));
+                        ctx.plus(leafSum.data()[1], leafSum.data()[1], *(outIter + 1));
+                        ctx.plus(leafSum.data()[2], leafSum.data()[2], *(outIter + 2));
+                        ctx.plus(leafSum.data()[3], leafSum.data()[3], *(outIter + 3));
+                        ctx.plus(leafSum.data()[4], leafSum.data()[4], *(outIter + 4));
+                        ctx.plus(leafSum.data()[5], leafSum.data()[5], *(outIter + 5));
+                        ctx.plus(leafSum.data()[6], leafSum.data()[6], *(outIter + 6));
+                        ctx.plus(leafSum.data()[7], leafSum.data()[7], *(outIter + 7));
+
+                        outIter += 8;
+                        assert(outIter <= leafLevel.end());
                     }
                 }
             }

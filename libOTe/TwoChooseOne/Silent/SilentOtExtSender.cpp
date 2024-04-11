@@ -192,6 +192,7 @@ namespace osuCrypto
         mNumPartitions = 0;
 
         mB = {};
+        mEncodeTemp = {};
 
         mDelta = block(0,0);
 
@@ -340,7 +341,6 @@ namespace osuCrypto
             delta = AlignedUnVector<block>{}
         );
 
-        gTimer.setTimePoint("sender.ot.enter");
         setTimePoint("sender.expand.enter");
 
         if (isConfigured() == false)
@@ -357,7 +357,6 @@ namespace osuCrypto
         }
 
         setTimePoint("sender.expand.start");
-        gTimer.setTimePoint("sender.expand.start");
 
         mDelta = d;
 
@@ -369,17 +368,21 @@ namespace osuCrypto
 
         MC_AWAIT(mGen.expand(chl, delta, prng.get(), mB, PprfOutputFormat::Interleaved, true, mNumThreads));
 
+        setTimePoint("sender.expand.pprf");
 
         if (mMalType == SilentSecType::Malicious)
+        {
             MC_AWAIT(ferretMalCheck(chl, prng));
+            setTimePoint("sender.expand.malcheck");
+        }
 
-        setTimePoint("sender.expand.pprf_transpose");
-        gTimer.setTimePoint("sender.expand.pprf_transpose");
 
         if (mDebug)
             MC_AWAIT(checkRT(chl));
 
         compress();
+
+        setTimePoint("sender.expand.dualEncode");
 
         mB.resize(mRequestNumOts);
 
@@ -468,9 +471,10 @@ namespace osuCrypto
         case osuCrypto::MultType::ExConv21x24:
         {
 
-            u64 expanderWeight = 0, accWeight = 0, _1;
-            double _2;
-            ExConvConfigure(mMultType, _1, expanderWeight, accWeight, _2);
+            u64 expanderWeight = 0, accWeight = 0, scaler = 0;
+            double minDist = 0;
+            ExConvConfigure(mMultType, scaler, expanderWeight, accWeight, minDist);
+            assert(scaler == 2 && minDist > 0 && minDist < 1);
 
             ExConvCode exConvEncoder;
             exConvEncoder.config(mRequestNumOts, mNoiseVecSize, expanderWeight, accWeight);
@@ -482,7 +486,8 @@ namespace osuCrypto
         {
             experimental::TungstenCode encoder;
             encoder.config(oc::roundUpTo(mRequestNumOts, 8), mNoiseVecSize);
-            encoder.dualEncode<block, CoeffCtxGF2>(mB.begin(), {});
+            
+            encoder.dualEncode<block, CoeffCtxGF2>(mB.begin(), {}, mEncodeTemp);
             break;
         }
         default:

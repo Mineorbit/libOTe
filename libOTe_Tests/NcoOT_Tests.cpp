@@ -367,7 +367,7 @@ throw UnitTestSkipped("ENALBE_KKRT is not defined.");
 #endif
     }
 
-    void NcoOt_chosen()
+    void NcoOt_chosen_Test()
     {
 #ifdef ENABLE_OOS
         setThreadName("Sender");

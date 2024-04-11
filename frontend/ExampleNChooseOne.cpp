@@ -26,7 +26,7 @@ namespace osuCrypto
         if (totalOTs == 0)
             totalOTs = 1 << 20;
 
-        bool randomOT = true;
+        bool randomOT = false;
         u64 numOTs = (u64)totalOTs;
         auto numChosenMsgs = 256;
 

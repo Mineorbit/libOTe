@@ -13,7 +13,7 @@ namespace tests_libOTe
     void NcoOt_Kkrt_Test();
     void NcoOt_Oos_Test();
     void NcoOt_genBaseOts_Test();
-    void NcoOt_chosen();
+    void NcoOt_chosen_Test();
 
     void Tools_LinearCode_Test();
     void Tools_LinearCode_sub_Test();

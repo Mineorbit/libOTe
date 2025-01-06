@@ -14,14 +14,15 @@
 #include "coproto/Socket/AsioSocket.h"
 #include "cryptoTools/Common/BitVector.h"
 #include "cryptoTools/Crypto/PRNG.h"
+#include "cryptoTools/Common/Timer.h"
 
 namespace osuCrypto
 {
 #ifdef ENABLE_IKNP
     void noHash(IknpOtExtSender& s, IknpOtExtReceiver& r)
     {
-        s.mHash = false;
-        r.mHash = false;
+        s.mHashType = HashType::NoHash;
+        r.mHashType = HashType::NoHash;
     }
 #endif
 
@@ -166,7 +167,7 @@ namespace osuCrypto
                 catch (std::exception& e)
                 {
                     std::cout << e.what() << std::endl;
-                    chl.close();
+                    cp::sync_wait(chl.close());
                 }
             }
             else
@@ -201,7 +202,7 @@ namespace osuCrypto
                 catch (std::exception& e)
                 {
                     std::cout << e.what() << std::endl;
-                    chl.close();
+                    cp::sync_wait(chl.close());
                 }
             }
 
@@ -299,6 +300,8 @@ namespace osuCrypto
             }
 
             work.reset();
+            for (u64 threadIndex = 0; threadIndex < (u64)numThreads; ++threadIndex)
+                macoro::sync_wait(threadChls[threadIndex].flush());
         }
 
 
